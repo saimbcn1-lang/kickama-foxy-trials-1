@@ -163,7 +163,7 @@ class CircuitBreaker:
         """Record a failed request."""
         with self._lock:
             self.failure_count += 1
-            self.last_failure_time = time.monotonic()
+            self.last_failure_time = time.time()
 
             if self.state == self.STATE_HALF_OPEN:
                 # Any failure in half-open reopens the circuit
@@ -480,12 +480,13 @@ def run_health_checks(
 
         if circuits_enabled and not cb.allow_request():
             results["services"][name] = {
-                "status": "WARNING",
+                "status": "CRITICAL",
                 "detail": f"Circuit OPEN — probe skipped ({cb.failure_count} failures)",
                 "code": 0,
                 "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
                 "circuit_state": cb.get_status()["state"],
             }
+            all_ok = False
             continue
 
         status, detail, code = with_retry(
@@ -527,11 +528,12 @@ def run_health_checks(
 
         if circuits_enabled and not cb.allow_request():
             results["infrastructure"][name] = {
-                "status": "WARNING",
+                "status": "CRITICAL",
                 "detail": f"Circuit OPEN — probe skipped ({cb.failure_count} failures)",
                 "endpoint": f"{config['host']}:{config['port']}",
                 "circuit_state": cb.get_status()["state"],
             }
+            all_ok = False
             continue
 
         status, detail, latency = with_retry(
@@ -662,7 +664,7 @@ def parse_args():
     parser.add_argument("--retries", type=int, default=2,
                         help="Max retry attempts per probe (default: 2)")
     parser.add_argument("--backoff", type=float, default=1.0,
-                        help="Base seconds for exponential backoff (default: 1.0)")
+                        help="Multiplier for exponential backoff (default: 1.0)")
     parser.add_argument("--no-circuit-breaker", action="store_true",
                         help="Disable circuit breaker protection")
     parser.add_argument("--cb-threshold", type=int, default=5,
@@ -681,17 +683,18 @@ def main():
 
     # Global circuit breaker config
     global CB_FAILURE_THRESHOLD, CB_RECOVERY_TIMEOUT
-    CB_FAILURE_THRESHOLD = args.cb_threshold
+    CB_FAILURE_THRESHOLD = args.circuit_threshold
     CB_RECOVERY_TIMEOUT = args.cb_recovery
 
-    # Aggregation window
+    # Aggregation window (only rebuild if not just showing summary)
     global _aggregator
-    _aggregator = HealthCheckAggregator(window_size=args.aggregation_window)
 
     if args.summary:
         summary = _aggregator.get_summary()
         print(json.dumps(summary, indent=2))
         return 0
+
+    _aggregator = HealthCheckAggregator(window_size=args.aggregation_window)
 
     if args.watch:
         logger.info("Continuous monitoring (interval: %ds). Press Ctrl+C to stop.", args.interval)
@@ -699,8 +702,8 @@ def main():
             while True:
                 results = run_health_checks(
                     args.service, args.json,
-                    max_retries=args.retries,
-                    backoff_base=args.backoff,
+                    max_retries=args.max_retries,
+                    backoff_base=args.backoff_factor,
                     circuits_enabled=not args.no_circuit_breaker,
                 )
                 if args.json:
@@ -713,8 +716,8 @@ def main():
     else:
         results = run_health_checks(
             args.service, args.json,
-            max_retries=args.retries,
-            backoff_base=args.backoff,
+            max_retries=args.max_retries,
+            backoff_base=args.backoff_factor,
             circuits_enabled=not args.no_circuit_breaker,
         )
         if args.json:
